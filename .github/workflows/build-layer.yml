@@ -1,0 +1,87 @@
+name: Build Lambda Layer
+
+on:
+  workflow_dispatch:  # Allows manual trigger from GitHub UI
+  push:
+    branches:
+      - main
+    paths:
+      - 'requirements.txt'
+
+jobs:
+  build-lambda-layer:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Create layer directory structure
+        run: |
+          mkdir -p layer/python
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt -t layer/python/ --no-cache-dir
+      
+      - name: Validate installation
+        run: |
+          cd layer
+          python3.11 -c "
+          import sys
+          sys.path.insert(0, 'python')
+          try:
+              import strands_agents
+              print('✓ strands_agents imported successfully')
+              import opentelemetry.trace
+              print('✓ opentelemetry imported successfully')
+              import azure.storage.blob
+              print('✓ azure.storage.blob imported successfully')
+              import boto3
+              print('✓ boto3 imported successfully')
+              print('\n✅ All imports successful!')
+          except Exception as e:
+              print(f'❌ Import failed: {e}')
+              import traceback
+              traceback.print_exc()
+              sys.exit(1)
+          "
+      
+      - name: Remove unnecessary files
+        run: |
+          cd layer/python
+          # Remove cache files
+          find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find . -type f -name "*.pyc" -delete
+          find . -type f -name "*.pyo" -delete
+          # Remove test directories
+          find . -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+          # Keep .dist-info for entry points!
+      
+      - name: Create ZIP file
+        run: |
+          cd layer
+          zip -r ../strands-lambda-layer.zip python/
+          cd ..
+          ls -lh strands-lambda-layer.zip
+      
+      - name: Upload layer as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: strands-lambda-layer
+          path: strands-lambda-layer.zip
+          retention-days: 7
+      
+      - name: Display success message
+        run: |
+          echo "✅ Lambda layer built successfully!"
+          echo "📦 Download the artifact from the Actions tab"
+          echo "📏 Layer size:"
+          du -h strands-lambda-layer.zip
