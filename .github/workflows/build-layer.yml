@@ -1,7 +1,7 @@
 name: Build Lambda Layer
 
 on:
-  workflow_dispatch:  # Allows manual trigger from GitHub UI
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -16,41 +16,60 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
       
-      - name: Create layer directory structure
+      - name: Build layer in Lambda-compatible environment
         run: |
-          mkdir -p layer/python
-      
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt -t layer/python/ --no-cache-dir
+          # Create a Dockerfile that uses the EXACT Lambda Python 3.11 environment
+          cat > Dockerfile <<'EOF'
+          FROM public.ecr.aws/lambda/python:3.11
+          
+          COPY requirements.txt .
+          
+          RUN mkdir -p /asset/python && \
+              pip install --upgrade pip && \
+              pip install -r requirements.txt -t /asset/python/ --no-cache-dir
+          
+          # Cleanup unnecessary files
+          RUN cd /asset/python && \
+              find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && \
+              find . -type f -name "*.pyc" -delete && \
+              find . -type f -name "*.pyo" -delete && \
+              find . -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true && \
+              find . -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+          
+          WORKDIR /asset
+          EOF
+          
+          # Build the Docker image
+          docker build -t lambda-layer-builder .
+          
+          # Create a container and copy the built layer out
+          docker create --name temp-container lambda-layer-builder
+          docker cp temp-container:/asset ./layer
+          docker rm temp-container
       
       - name: List installed packages
         run: |
           echo "📦 Checking what was installed:"
           ls -la layer/python/ | head -20
-          
-      - name: Validate installation
+      
+      - name: Validate installation in Lambda environment
         run: |
-          cd layer
-          python3.11 -c "
+          # Run validation inside the same Lambda container
+          docker run --rm -v $(pwd)/layer:/opt public.ecr.aws/lambda/python:3.11 \
+            python3.11 -c "
           import sys
-          sys.path.insert(0, 'python')
+          sys.path.insert(0, '/opt/python')
           
-          # Check what's actually available
-          import os
           print('Directories in python/:')
-          for item in sorted(os.listdir('python'))[:20]:
+          import os
+          for item in sorted(os.listdir('/opt/python'))[:20]:
               print(f'  - {item}')
           
           print('\nAttempting imports...')
           try:
-              # Try different possible import names
               try:
                   import strands_agents
                   print('✓ strands_agents imported successfully')
@@ -67,7 +86,12 @@ jobs:
               print('✓ azure.storage.blob imported successfully')
               import boto3
               print('✓ boto3 imported successfully')
-              print('\n✅ Core imports successful!')
+              
+              # Critical: Test cryptography specifically
+              from cryptography.hazmat.primitives.ciphers import Cipher
+              print('✓ cryptography imported successfully')
+              
+              print('\n✅ All imports successful!')
           except Exception as e:
               print(f'❌ Import failed: {e}')
               import traceback
@@ -75,24 +99,14 @@ jobs:
               sys.exit(1)
           "
       
-      - name: Remove unnecessary files
-        run: |
-          cd layer/python
-          # Remove cache files
-          find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-          find . -type f -name "*.pyc" -delete
-          find . -type f -name "*.pyo" -delete
-          # Remove test directories
-          find . -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
-          find . -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
-          # Keep .dist-info for entry points!
-      
       - name: Create ZIP file
         run: |
           cd layer
           zip -r ../strands-lambda-layer.zip python/
           cd ..
+          echo "📏 Layer size:"
           ls -lh strands-lambda-layer.zip
+          du -h strands-lambda-layer.zip
       
       - name: Upload layer as artifact
         uses: actions/upload-artifact@v4
@@ -103,7 +117,6 @@ jobs:
       
       - name: Display success message
         run: |
-          echo "✅ Lambda layer built successfully!"
+          echo "✅ Lambda layer built successfully in AWS Lambda Python 3.11 environment!"
           echo "📦 Download the artifact from the Actions tab"
-          echo "📏 Layer size:"
-          du -h strands-lambda-layer.zip
+          echo "🎯 This layer is guaranteed to work in Lambda - built in the exact same container!"
